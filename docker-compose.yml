@@ -1,0 +1,338 @@
+# NexaGen AI Ops Platform - Docker Compose
+# Local development environment with all services
+
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: nexagen-postgres
+    environment:
+      POSTGRES_DB: nexagen_db
+      POSTGRES_USER: nexagen_user
+      POSTGRES_PASSWORD: nexagen_pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/database/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - nexagen-network
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: nexagen-redis
+    command: redis-server --requirepass nexagen_redis_pass
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - nexagen-network
+
+  # ChromaDB Vector Database
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: nexagen-chromadb
+    environment:
+      - CHROMA_SERVER_AUTH_CREDENTIALS_PROVIDER=token
+      - CHROMA_SERVER_AUTH_TOKEN_TRANSPORT_HEADER=Authorization
+      - CHROMA_AUTH_TOKEN_SECRET=nexagen_chroma_secret
+    ports:
+      - "8000:8000"
+    volumes:
+      - chromadb_data:/chroma/chroma
+    networks:
+      - nexagen-network
+
+  # Prometheus Monitoring
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: nexagen-prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus:/etc/prometheus
+      - prometheus_data:/prometheus
+    networks:
+      - nexagen-network
+
+  # Grafana Dashboard
+  grafana:
+    image: grafana/grafana:latest
+    container_name: nexagen-grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=nexagen_admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_INSTALL_PLUGINS=grafana-piechart-panel
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards
+    depends_on:
+      - prometheus
+    networks:
+      - nexagen-network
+
+  # Jaeger Tracing
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: nexagen-jaeger
+    environment:
+      - COLLECTOR_ZIPKIN_HOST_PORT=:9411
+      - COLLECTOR_OTLP_ENABLED=true
+    ports:
+      - "16686:16686"
+      - "14268:14268"
+      - "14250:14250"
+      - "9411:9411"
+    networks:
+      - nexagen-network
+
+  # NexaGen API Service
+  nexagen-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: nexagen-api
+    environment:
+      - ENVIRONMENT=development
+      - DEBUG=true
+      - DATABASE_URL=postgresql://nexagen_user:nexagen_pass@postgres:5432/nexagen_db
+      - REDIS_URL=redis://:nexagen_redis_pass@redis:6379/0
+      - CHROMA_HOST=chromadb
+      - CHROMA_PORT=8000
+      - PROMETHEUS_URL=http://prometheus:9090
+      - JAEGER_AGENT_HOST=jaeger
+      - JAEGER_AGENT_PORT=6831
+      # Azure Configuration (from .env)
+      - AZURE_SUBSCRIPTION_ID=${AZURE_SUBSCRIPTION_ID}
+      - AZURE_TENANT_ID=${AZURE_TENANT_ID}
+      - AZURE_CLIENT_ID=${AZURE_CLIENT_ID}
+      - AZURE_CLIENT_SECRET=${AZURE_CLIENT_SECRET}
+      - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT}
+      - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY}
+      - AZURE_SEARCH_ENDPOINT=${AZURE_SEARCH_ENDPOINT}
+      - AZURE_SEARCH_API_KEY=${AZURE_SEARCH_API_KEY}
+      - AZURE_COMPUTER_VISION_ENDPOINT=${AZURE_COMPUTER_VISION_ENDPOINT}
+      - AZURE_COMPUTER_VISION_KEY=${AZURE_COMPUTER_VISION_KEY}
+      - AZURE_CONTENT_SAFETY_ENDPOINT=${AZURE_CONTENT_SAFETY_ENDPOINT}
+      - AZURE_CONTENT_SAFETY_KEY=${AZURE_CONTENT_SAFETY_KEY}
+      # GCP Configuration (from .env)
+      - GOOGLE_CLOUD_PROJECT=${GOOGLE_CLOUD_PROJECT}
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-credentials.json
+      - VERTEX_AI_LOCATION=${VERTEX_AI_LOCATION}
+    ports:
+      - "8001:8000"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ${GOOGLE_APPLICATION_CREDENTIALS}:/app/gcp-credentials.json:ro
+    depends_on:
+      - postgres
+      - redis
+      - chromadb
+    networks:
+      - nexagen-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Data Processing Worker
+  nexagen-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: nexagen-worker
+    environment:
+      - ENVIRONMENT=development
+      - DATABASE_URL=postgresql://nexagen_user:nexagen_pass@postgres:5432/nexagen_db
+      - REDIS_URL=redis://:nexagen_redis_pass@redis:6379/0
+      - CHROMA_HOST=chromadb
+      - CHROMA_PORT=8000
+      # Azure Configuration
+      - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT}
+      - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY}
+      - AZURE_COMPUTER_VISION_ENDPOINT=${AZURE_COMPUTER_VISION_ENDPOINT}
+      - AZURE_COMPUTER_VISION_KEY=${AZURE_COMPUTER_VISION_KEY}
+      # GCP Configuration
+      - GOOGLE_CLOUD_PROJECT=${GOOGLE_CLOUD_PROJECT}
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-credentials.json
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ${GOOGLE_APPLICATION_CREDENTIALS}:/app/gcp-credentials.json:ro
+    depends_on:
+      - postgres
+      - redis
+      - chromadb
+    networks:
+      - nexagen-network
+
+  # Frontend Dashboard (Optional)
+  nexagen-frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: nexagen-frontend
+    environment:
+      - REACT_APP_API_URL=http://localhost:8001
+      - REACT_APP_ENVIRONMENT=development
+    ports:
+      - "3001:3000"
+    depends_on:
+      - nexagen-api
+    networks:
+      - nexagen-network
+
+  # Nginx Reverse Proxy
+  nginx:
+    image: nginx:alpine
+    container_name: nexagen-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/sites:/etc/nginx/sites-available:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - ./logs/nginx:/var/log/nginx
+    depends_on:
+      - nexagen-api
+      - nexagen-frontend
+      - grafana
+    networks:
+      - nexagen-network
+
+  # Log Aggregation
+  loki:
+    image: grafana/loki:latest
+    container_name: nexagen-loki
+    command: -config.file=/etc/loki/local-config.yaml
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./monitoring/loki:/etc/loki
+      - loki_data:/loki
+    networks:
+      - nexagen-network
+
+  # Log Collection
+  promtail:
+    image: grafana/promtail:latest
+    container_name: nexagen-promtail
+    command: -config.file=/etc/promtail/config.yml
+    volumes:
+      - ./logs:/var/log:ro
+      - ./monitoring/promtail:/etc/promtail
+    depends_on:
+      - loki
+    networks:
+      - nexagen-network
+
+  # MinIO (S3-compatible storage for development)
+  minio:
+    image: minio/minio:latest
+    container_name: nexagen-minio
+    command: server /data --console-address ":9001"
+    environment:
+      - MINIO_ROOT_USER=nexagen_admin
+      - MINIO_ROOT_PASSWORD=nexagen_minio_pass
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - nexagen-network
+
+  # MLflow Tracking Server
+  mlflow:
+    image: python:3.11-slim
+    container_name: nexagen-mlflow
+    command: >
+      bash -c "pip install mlflow psycopg2-binary &&
+               mlflow server
+               --backend-store-uri postgresql://nexagen_user:nexagen_pass@postgres:5432/nexagen_db
+               --default-artifact-root s3://mlflow-artifacts/
+               --host 0.0.0.0
+               --port 5000"
+    environment:
+      - AWS_ACCESS_KEY_ID=nexagen_admin
+      - AWS_SECRET_ACCESS_KEY=nexagen_minio_pass
+      - MLFLOW_S3_ENDPOINT_URL=http://minio:9000
+    ports:
+      - "5000:5000"
+    depends_on:
+      - postgres
+      - minio
+    networks:
+      - nexagen-network
+
+  # Jupyter Lab (for development and experimentation)
+  jupyter:
+    image: jupyter/tensorflow-notebook:latest
+    container_name: nexagen-jupyter
+    environment:
+      - JUPYTER_ENABLE_LAB=yes
+      - JUPYTER_TOKEN=nexagen_jupyter_token
+    ports:
+      - "8888:8888"
+    volumes:
+      - ./notebooks:/home/jovyan/work
+      - ./data:/home/jovyan/work/data
+      - ${GOOGLE_APPLICATION_CREDENTIALS}:/home/jovyan/gcp-credentials.json:ro
+    networks:
+      - nexagen-network
+
+  # Watchtower (Auto-update containers in development)
+  watchtower:
+    image: containrrr/watchtower
+    container_name: nexagen-watchtower
+    environment:
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_POLL_INTERVAL=3600
+      - WATCHTOWER_INCLUDE_RESTARTING=true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - nexagen-network
+
+# Named volumes for data persistence
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  chromadb_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  loki_data:
+    driver: local
+  minio_data:
+    driver: local
+
+# Custom network
+networks:
+  nexagen-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
